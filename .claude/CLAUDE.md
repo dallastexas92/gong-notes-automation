@@ -162,7 +162,7 @@ See [.claude/skills/google-apis.md](.claude/skills/google-apis.md) for complete 
 Key points:
 - Service account auth with required scopes (drive, documents)
 - Drive search requires `corpora='allDrives'` for Shared Drives
-- Multi-pattern folder search handles domain variations (e.g., "herondata.io" → "Heron Data")
+- Multi-pattern folder search handles domain variations (e.g., "companyname.io" → "Company Name")
 - Docs index positioning: `1` = start of doc, `endIndex-1` = end of doc
 - Batch update order matters to avoid index shifting
 
@@ -196,20 +196,68 @@ TEST_DOC_URL=https://docs.google.com/document/d/YOUR_DOC_ID/edit
 
 ### Working ✅
 - Gong API: Fetch transcripts via POST to `/v2/calls/transcript` with account name extraction
-- Google Drive API: Multi-pattern folder search with `corpora='allDrives'` support
+- ~~Google Drive API: Multi-pattern folder search with `corpora='allDrives'` support~~ ⚠️ **BEING REPLACED** - See "LLM-Powered Improvements" below
 - Claude API: Two-part output (snapshot + call notes) via Sonnet 4.5
 - Google Docs: Read/write with service account auth, date-based meeting block matching
 - Note insertion: Correctly finds "Attendees:" paragraph and inserts without index shifting
 - Temporal workflow: 4-step process (fetch → read → structure → write) with signals for error recovery
 - Worker + trigger scripts functional
 
+### LLM-Powered Improvements (In Progress) 🚀
+
+The system is being enhanced to use LLMs for brittle logic instead of manual parsing. Test script: `scripts/test_llm_doc_finder.py`
+
+#### 1. Doc Discovery (✅ Tested, Ready to Integrate)
+**Old brittle approach:**
+- Parse TLD from email: `user@company.io` → strip `.io` → `company`
+- Multi-pattern search: try 8-char, 6-char, 4-char prefixes
+- Breaks on: `.co.uk`, hyphens, name variations, multiple folders
+
+**New LLM approach:** ([test_llm_doc_finder.py](../scripts/test_llm_doc_finder.py))
+1. **Primary:** Search Drive by participant email (`fullText contains 'email@domain.com'`)
+2. **Fallback:** Search folders by company prefix, get docs inside
+3. **Claude validates:** Picks correct meeting notes doc from results
+4. Handles sparse docs (no emails yet) and name variations naturally
+
+**Results:**
+- ✅ Works for docs with emails indexed
+- ✅ Works for sparse docs via folder fallback
+- ✅ Claude correctly identifies "Use Case" docs that contain meeting notes
+- Ready to replace `find_google_doc` activity in workflow
+
+#### 2. Note Insertion Point (TODO - Next Priority)
+**Current brittle approach:**
+- Parse call date from Gong (handle timestamp OR ISO string)
+- Search for HEADING_2 with exact date match in `dateElement.dateElementProperties.timestamp`
+- Find "Attendees:" paragraph after heading
+- Insert at `endIndex`
+
+**Proposed LLM approach:**
+- Read doc structure around call date
+- Ask Claude: "Where should I insert notes for this call date/title?"
+- Claude returns insertion index + reasoning
+- Handles edge cases: missing blocks, wrong dates, multiple meetings same day
+
+#### 3. Markdown Formatting (TODO)
+**Current issue:**
+- Claude outputs markdown: `**bold**`, `## Heading`, `- bullets`
+- Inserted as plain text into Google Doc (no formatting)
+
+**Proposed solution:**
+- Parse Claude's markdown output
+- Convert to Google Docs batch update requests with `textStyle` formatting
+- Example: `**bold**` → `{"updateTextStyle": {"bold": true, "range": {...}}}`
+
 ### Known Issues & TODO
-1. ~~**Doc discovery**: Currently uses hardcoded `TEST_DOC_URL`, should search Drive by account name~~ ✅ **FIXED** - Google Drive search working with multi-pattern fallback
+1. ~~**Doc discovery**: Currently uses hardcoded `TEST_DOC_URL`, should search Drive by account name~~ ✅ **FIXED** - LLM-powered doc finder tested and working
 2. ~~**Date matching**: Matches call title but not date - can insert notes under wrong meeting block~~ ✅ **FIXED** - Date matching compares `dateElement.dateElementProperties.timestamp` with call date
 3. ~~**Index shifting bug**: Notes inserted at wrong location~~ ✅ **FIXED** - Reordered batch update requests to insert notes first, then snapshot
-4. **Error recovery**: Workflow signals implemented for missing doc/block, but trigger.py only handles doc URL signal (not confirm_block_created signal)
-5. **No call type logic**: Single prompt for all call types (Discovery, Technical, Check-in, etc.)
-6. **Slack activity**: Defined but not called in workflow
+4. **Doc finder integration**: Replace `find_google_doc` activity with LLM approach from test script
+5. **Note insertion**: Replace brittle date matching with LLM-powered insertion point detection
+6. **Markdown formatting**: Convert Claude output to Google Docs formatting (bold, bullets, etc.)
+7. **Error recovery**: Workflow signals implemented for missing doc/block, but trigger.py only handles doc URL signal (not confirm_block_created signal)
+8. **No call type logic**: Single prompt for all call types (Discovery, Technical, Check-in, etc.)
+9. **Slack activity**: Defined but not called in workflow
 
 ## File Structure
 ```
