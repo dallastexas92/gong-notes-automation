@@ -149,6 +149,12 @@ Documents found:
 
 Task: Identify which document is used to write MEETING NOTES after each call.
 
+Important context:
+- "Use Case" docs often ALSO contain meeting notes sections
+- If there's BOTH a dedicated "Notes" doc AND a "Use Case" doc, prefer the Notes doc
+- If there's ONLY a "Use Case" doc, it likely contains the meeting notes - select it
+- Exclude docs that are clearly not for notes (e.g., "Sales Deck", "Proposal", "Contract")
+
 Return ONLY valid JSON:
 {{"doc_id": "abc123", "doc_name": "Meeting Notes", "confidence": "high", "reasoning": "..."}}
 """
@@ -160,6 +166,7 @@ Return ONLY valid JSON:
     )
 
     output = message.content[0].text
+
     if "```json" in output:
         json_str = output.split("```json")[1].split("```")[0].strip()
     else:
@@ -168,6 +175,11 @@ Return ONLY valid JSON:
     result = json.loads(json_str)
     doc_id = result.get("doc_id")
     doc_name = result.get("doc_name", "Unknown")
+
+    if not doc_id:
+        print(f"  ✗ ERROR: Claude did not return a doc_id")
+        print(f"  → Full response: {result}")
+        raise ValueError(f"Claude did not return a doc_id. Response: {result}")
 
     print(f"  ✓ Found: {doc_name}")
 
@@ -303,7 +315,7 @@ def read_doc_structure(doc_url: str) -> dict:
     )
     service = build("docs", "v1", credentials=credentials)
 
-    print(f"[1/5] Reading document structure...")
+    print(f"  Reading document structure...")
     doc = service.documents().get(documentId=doc_id).execute()
 
     # Extract text content with structure info
@@ -353,7 +365,7 @@ def ask_claude_where_to_insert(doc_structure: dict, call_date: str, snapshot_tex
 
     client = Anthropic(api_key=api_key)
 
-    print(f"\n[2/5] Asking Claude where to insert content...")
+    print(f"  Asking Claude where to insert content...")
 
     # Prepare doc structure for Claude
     content_summary = []
@@ -465,6 +477,9 @@ def show_dry_run(doc_structure: dict, insertion_plan: dict, snapshot: str, call_
         if notes_loc.get("needs_date_block_creation"):
             print(f"\n2. CALL NOTES: ⚠️  Date block missing!")
             print(f"   Reasoning: {notes_loc['reasoning']}")
+        elif notes_loc.get("skipped"):
+            print(f"\n2. CALL NOTES: ⚠️  Skipped")
+            print(f"   Reasoning: {notes_loc['reasoning']}")
         else:
             print(f"\n2. CALL NOTES (insert at index {notes_loc['insert_index']}):")
             print(f"   Reasoning: {notes_loc['reasoning']}")
@@ -489,7 +504,7 @@ def execute_writes(doc_id: str, insertion_plan: dict, snapshot: str, call_notes:
     # Step 1: Insert call notes FIRST (before indices shift)
     if "notes_location" in insertion_plan:
         notes_loc = insertion_plan["notes_location"]
-        if not notes_loc.get("needs_date_block_creation"):
+        if not notes_loc.get("needs_date_block_creation") and not notes_loc.get("skipped"):
             requests_body.append({
                 "insertText": {
                     "location": {"index": notes_loc["insert_index"]},
@@ -497,6 +512,8 @@ def execute_writes(doc_id: str, insertion_plan: dict, snapshot: str, call_notes:
                 }
             })
             print(f"  ✓ Queued call notes insertion at index {notes_loc['insert_index']}")
+        elif notes_loc.get("skipped"):
+            print(f"  ⊘ Skipping call notes insertion (date block not found)")
 
     # Step 2: Handle snapshot (replace or insert)
     if "snapshot_location" in insertion_plan:
@@ -567,18 +584,52 @@ def main():
     # Step 4: Structure with Claude
     structured = structure_with_claude(transcript_data, existing_snapshot)
 
-    # Step 5: Read doc structure
-    print(f"\n[5/6] Reading document structure...")
-    doc_structure = read_doc_structure(doc_url)
+    # Step 5: Read doc structure and determine insertion points (with retry for missing date block)
+    max_retries = 3
+    retry_count = 0
+    insertion_plan = None
 
-    # Step 6: Ask Claude where to insert
-    print(f"\n[6/6] Asking Claude where to insert content...")
-    insertion_plan = ask_claude_where_to_insert(
-        doc_structure,
-        transcript_data["call_date_display"],
-        structured["snapshot"],
-        structured["call_notes"]
-    )
+    while retry_count < max_retries:
+        print(f"\n[5/6] Reading document structure...")
+        doc_structure = read_doc_structure(doc_url)
+
+        # Step 6: Ask Claude where to insert
+        print(f"\n[6/6] Asking Claude where to insert content...")
+        insertion_plan = ask_claude_where_to_insert(
+            doc_structure,
+            transcript_data["call_date_display"],
+            structured["snapshot"],
+            structured["call_notes"]
+        )
+
+        # Check if date block is missing
+        notes_location = insertion_plan.get("notes_location", {})
+        if notes_location.get("needs_date_block_creation"):
+            print(f"\n⚠️  MISSING DATE BLOCK")
+            print(f"=" * 80)
+            print(f"The document does not have a meeting notes block for the call on {transcript_data['call_date_display']}")
+            print(f"\nPlease:")
+            print(f"  1. Open the document: {doc_url}")
+            print(f"  2. Add a meeting notes block for this call (use '@meeting notes' in Google Docs)")
+            print(f"=" * 80)
+
+            retry = input(f"\nPress Enter when ready to retry, or type 'skip' to continue without inserting call notes: ").strip().lower()
+            if retry == 'skip':
+                print(f"\n⚠️  Skipping call notes insertion - will only insert snapshot")
+                # Remove notes_location to skip inserting call notes
+                insertion_plan["notes_location"] = {"skipped": True, "reasoning": "User chose to skip - date block not found"}
+                break
+
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"\nRetrying ({retry_count}/{max_retries})...")
+            else:
+                print(f"\n✗ Max retries reached. Call notes will not be inserted.")
+                insertion_plan["notes_location"] = {"skipped": True, "reasoning": "Max retries reached - date block not found"}
+                break
+        else:
+            # Date block found, proceed
+            break
 
     # Show dry run
     print(f"\nDRY RUN - What will be written:")
