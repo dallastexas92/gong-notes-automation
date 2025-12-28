@@ -62,29 +62,6 @@ docs = doc_results.get("files", [])
 - **Parent folder**: `'folder_id' in parents`
 - **Combine**: Use `and` operator
 
-### Multi-Pattern Search Strategy
-When searching by company name, try decreasing specificity:
-```python
-patterns = [
-    "Heron Data",      # Full extracted name
-    "herondata",       # lowercase, no spaces (first 8 chars)
-    "herond",          # first 6 chars
-    "hero"             # first 4 chars
-]
-
-for pattern in patterns:
-    query = f"name contains '{pattern}' and mimeType='application/vnd.google-apps.folder'"
-    results = drive_service.files().list(q=query, ...).execute()
-    folders = results.get("files", [])
-
-    if len(folders) == 1:
-        # Unique match found!
-        break
-    elif len(folders) > 1:
-        # Multiple matches, continue to more specific pattern
-        continue
-```
-
 ## Google Docs API (v1)
 
 ### Reading a Document

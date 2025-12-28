@@ -237,7 +237,7 @@ transcript_text = "\n".join(transcript_lines)
 for party in parties:
     email = party.get("emailAddress", "")
     if email and not email.endswith("@temporal.io"):
-        domain = email.split("@")[1]  # "herondata.io"
+        domain = email.split("@")[1]  # "example.com"
 
         # Strip common TLDs
         for tld in [".io", ".com", ".net", ".org", ".co"]:
@@ -246,7 +246,7 @@ for party in parties:
                 break
 
         # Replace hyphens with spaces and capitalize
-        account_name = domain.replace("-", " ").title()  # "Heron Data"
+        account_name = domain.replace("-", " ").title()  # "Example"
         break
 ```
 

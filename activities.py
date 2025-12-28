@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 import requests
 from anthropic import Anthropic
 from temporalio import activity
@@ -33,6 +34,7 @@ async def fetch_gong_transcript(call_id: str) -> GongTranscript:
     auth = (api_key, api_secret)
 
     # Fetch call metadata with parties info using extensive endpoint
+    activity.logger.info(f"\n{'='*60}\n[WORKFLOW START] Processing call {call_id}\n{'='*60}")
     activity.logger.info(f"Fetching call metadata for {call_id}")
     meta_response = requests.post(
         "https://api.gong.io/v2/calls/extensive",
@@ -113,7 +115,7 @@ You will receive:
 1. Current account snapshot (if exists)
 2. New call transcript
 
-Output TWO sections separated by "---SPLIT---":
+Output THREE sections separated by "---SUMMARY---" and "---SPLIT---":
 
 **SECTION 1: Updated Account Snapshot**
 Format:
@@ -138,7 +140,24 @@ Additional Use Cases: [if any]
 
 Update this section based on new information from the call. Preserve existing details not contradicted by new call.
 
-**SECTION 2: Call Notes** (no date header - Google Docs handles that)
+---SUMMARY---
+
+**SECTION 2: Call Summary** (quick scan - inserted at top of doc)
+Format as 3-5 concise bullet points for quick review:
+- Primary topic or decision from this call
+- Key outcomes or action items
+- Critical blockers (if any)
+- Notable technical details
+- Urgent follow-ups
+
+Guidelines:
+- Keep each bullet to one line
+- Focus on "need to know" before next interaction
+- Use markdown for **emphasis** on critical items
+
+---SPLIT---
+
+**SECTION 3: Detailed Call Notes** (comprehensive - inserted under date block)
 Format as conversational bullets:
 
 **Participants**
@@ -168,12 +187,13 @@ Guidelines:
 - Be conversational and scannable
 - Include direct quotes when useful
 - Add phonetic spellings: "Lukasz (lukash)"
-- Focus on substance over formatting"""
+- Focus on substance over formatting
+- Use markdown: **bold** for emphasis, ## for headings, - for bullets"""
 
 
 @activity.defn
 async def structure_with_claude(transcript: GongTranscript, existing_snapshot: str) -> dict:
-    """Structure transcript into snapshot + call notes."""
+    """Structure transcript into snapshot + summary + detailed call notes."""
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY must be set")
@@ -194,25 +214,41 @@ Transcript:
 {transcript.transcript_text}"""
 
     message = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model="claude-sonnet-4-5-j50929",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt_content}]
     )
 
     output = message.content[0].text
 
-    # Split output into snapshot and call notes
-    if "---SPLIT---" in output:
+    # Split output into 3 sections: snapshot, summary, detailed notes
+    if "---SUMMARY---" in output and "---SPLIT---" in output:
+        # Parse 3 sections (new format)
+        parts_1 = output.split("---SUMMARY---")
+        snapshot = parts_1[0].strip()
+
+        parts_2 = parts_1[1].split("---SPLIT---")
+        summary = parts_2[0].strip()
+        call_notes = parts_2[1].strip()
+
+        activity.logger.info("Successfully parsed 3 sections (snapshot, summary, detailed notes)")
+    elif "---SPLIT---" in output:
+        # Fallback for 2-section format (backward compatibility)
         parts = output.split("---SPLIT---")
         snapshot = parts[0].strip()
         call_notes = parts[1].strip()
+        # Generate simple summary from first 500 chars of call notes
+        summary = call_notes[:500] + "..." if len(call_notes) > 500 else call_notes
+        activity.logger.warning("Falling back to 2-section format, generated summary from call_notes")
     else:
-        # Fallback if Claude doesn't split properly
+        # Old fallback if no split markers
         snapshot = output[:output.find("=== END SNAPSHOT ===")+len("=== END SNAPSHOT ===")] if "=== END SNAPSHOT ===" in output else ""
         call_notes = output[output.find("=== END SNAPSHOT ===")+len("=== END SNAPSHOT ==="):] if "=== END SNAPSHOT ===" in output else output
+        summary = ""
+        activity.logger.warning("No split markers found, using old fallback logic")
 
-    activity.logger.info("Successfully structured notes with Claude")
-    return {"snapshot": snapshot, "call_notes": call_notes}
+    activity.logger.info(f"Successfully structured notes - snapshot: {len(snapshot)} chars, summary: {len(summary)} chars, notes: {len(call_notes)} chars")
+    return {"snapshot": snapshot, "summary": summary, "call_notes": call_notes}
 
 
 # === GOOGLE DRIVE ===
@@ -232,9 +268,8 @@ async def find_google_doc(account_name: str) -> str:
 
     # Try multiple search patterns with decreasing specificity
     # This handles various folder naming patterns:
-    # - "Herondata" → "Heron Data"
-    # - "Neoagent" → "Neo Agent"
-    # - "Neubegerberman" → "Neuberger Berman"
+    # - "Companyname" → "Company Name"
+    # - "Acmecorp" → "Acme Corp"
     patterns = [
         account_name,  # Full extracted name
         account_name.lower()[:8],  # First 8 chars
@@ -317,6 +352,205 @@ async def find_google_doc(account_name: str) -> str:
     return ""
 
 
+@activity.defn
+async def llm_find_google_doc(call_id: str, parties: list[dict]) -> str:
+    """
+    LLM-powered doc finder: Uses customer email from Gong to search Drive,
+    then asks Claude to identify the meeting notes doc.
+    Returns doc URL or empty string if not found.
+
+    Args:
+        call_id: Gong call ID (for logging)
+        parties: Participant data from fetch_gong_transcript (avoids redundant API call)
+    """
+    # Get API keys
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    if not all([anthropic_api_key, credentials_path]):
+        raise ValueError("Missing required API credentials")
+
+    # Step 1: Extract customer participants from provided parties data
+    activity.logger.info(f"Finding doc for call {call_id} using provided participant data")
+    customer_participants = []
+
+    for party in parties:
+        email = party.get("emailAddress", "")
+        name = party.get("name", "")
+        if email and not email.endswith("@temporal.io"):
+            customer_participants.append({"email": email, "name": name})
+
+    if not customer_participants:
+        activity.logger.warning("No customer participants found")
+        return ""
+
+    activity.logger.info(f"Found {len(customer_participants)} customer participant(s)")
+
+    # Step 2: Search Google Drive
+    credentials = service_account.Credentials.from_service_account_file(
+        credentials_path,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    service = build("drive", "v3", credentials=credentials)
+
+    # First try: Search by company folder
+    domain = customer_participants[0]["email"].split("@")[1]
+    company_prefix = domain.split(".")[0]
+
+    activity.logger.info(f"Searching for folders matching '{company_prefix}'")
+    folder_query = f"name contains '{company_prefix}' and mimeType='application/vnd.google-apps.folder'"
+    folder_results = service.files().list(
+        q=folder_query,
+        fields="files(id, name)",
+        pageSize=20,
+        corpora='allDrives',
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
+
+    folders = folder_results.get("files", [])
+    folder_docs_found = []
+
+    if folders:
+        activity.logger.info(f"Found {len(folders)} folder(s)")
+        for folder in folders:
+            # Get docs in this folder
+            docs_in_folder_query = f"'{folder['id']}' in parents and mimeType='application/vnd.google-apps.document'"
+            docs_in_folder_results = service.files().list(
+                q=docs_in_folder_query,
+                fields="files(id, name)",
+                pageSize=10,
+                corpora='allDrives',
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            docs_in_folder = docs_in_folder_results.get("files", [])
+            if docs_in_folder:
+                for doc in docs_in_folder:
+                    folder_docs_found.append({"id": doc["id"], "name": doc["name"], "folder": folder["name"]})
+
+    # Second try: Search for docs containing customer email addresses
+    docs_by_email = []
+    matched_email = ""
+    matched_name = ""
+
+    for participant in customer_participants:
+        email = participant["email"]
+        name = participant["name"]
+
+        activity.logger.info(f"Searching for docs containing {email}")
+        query = f"fullText contains '{email}' and mimeType='application/vnd.google-apps.document'"
+        results = service.files().list(
+            q=query,
+            fields="files(id, name)",
+            pageSize=20,
+            corpora='allDrives',
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+
+        docs = results.get("files", [])
+        if docs:
+            activity.logger.info(f"Found {len(docs)} doc(s) containing {email}")
+            docs_by_email = [{"id": d["id"], "name": d["name"]} for d in docs]
+            matched_email = email
+            matched_name = name
+            break
+
+    # Determine which docs to use
+    if docs_by_email:
+        docs_to_check = docs_by_email
+        match_type = "email"
+    elif folder_docs_found:
+        docs_to_check = folder_docs_found
+        match_type = "folder"
+        matched_email = customer_participants[0]["email"]
+        matched_name = customer_participants[0]["name"]
+    else:
+        activity.logger.warning("No docs found by email or folder search")
+        return ""
+
+    activity.logger.info(f"Found {len(docs_to_check)} docs via {match_type} search")
+
+    # Step 3: Ask Claude to identify the meeting notes doc
+    client = Anthropic(api_key=anthropic_api_key)
+
+    prompt = f"""You are helping find the correct Google Doc for meeting notes.
+
+We searched Google Drive for docs containing this customer's email and found these results:
+
+Customer: {matched_name} <{matched_email}>
+
+Documents found:
+{json.dumps(docs_to_check, indent=2)}
+
+Task: Identify which document is used to write MEETING NOTES after each call.
+
+Important context:
+- "Use Case" docs often ALSO contain meeting notes sections
+- If there's BOTH a dedicated "Notes" doc AND a "Use Case" doc, prefer the Notes doc
+- If there's ONLY a "Use Case" doc, it likely contains the meeting notes - select it
+- Exclude docs that are clearly not for notes (e.g., "Sales Deck", "Proposal", "Contract")
+
+Return ONLY valid JSON in one of these formats:
+
+Single match (high confidence):
+{{"doc_id": "abc123", "doc_name": "Meeting Notes", "confidence": "high", "reasoning": "..."}}
+
+Multiple matches (need user choice):
+{{"options": [{{"doc_id": "...", "doc_name": "..."}}, ...], "needs_user_choice": true, "reasoning": "..."}}
+
+No valid doc found:
+{{"error": "No meeting notes doc found", "reasoning": "..."}}
+"""
+
+    activity.logger.info("Asking Claude to identify meeting notes doc")
+    message = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    output = message.content[0].text
+    activity.logger.info(f"Claude response received: {output[:100]}...")
+
+    # Parse JSON response
+    try:
+        # Extract JSON from markdown code blocks if present
+        if "```json" in output:
+            json_str = output.split("```json")[1].split("```")[0].strip()
+        elif "```" in output:
+            json_str = output.split("```")[1].split("```")[0].strip()
+        else:
+            json_str = output.strip()
+
+        result = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        activity.logger.error(f"Failed to parse Claude response as JSON: {e}")
+        return ""
+
+    # Handle result
+    if "error" in result:
+        activity.logger.warning(f"Claude found no valid doc: {result.get('reasoning')}")
+        return ""
+
+    elif result.get("needs_user_choice"):
+        activity.logger.warning(f"Multiple docs found, need user choice: {result.get('reasoning')}")
+        # Return empty to trigger workflow signal for user input
+        return ""
+
+    else:
+        doc_id = result.get("doc_id")
+        doc_name = result.get("doc_name", "Unknown")
+        confidence = result.get("confidence", "unknown")
+        reasoning = result.get("reasoning", "N/A")
+
+        activity.logger.info(f"Found meeting notes doc: {doc_name} (confidence: {confidence})")
+        activity.logger.info(f"Reasoning: {reasoning}")
+
+        return f"https://docs.google.com/document/d/{doc_id}/edit"
+
+
 # === GOOGLE DOCS ===
 
 SNAPSHOT_MARKER_START = "=== ACCOUNT SNAPSHOT ==="
@@ -357,8 +591,8 @@ async def read_google_doc(doc_url: str) -> str:
 
 
 @activity.defn
-async def append_to_google_doc(snapshot: str, call_notes: str, doc_url: str, call_date: str) -> bool:
-    """Append formatted notes to Google Doc."""
+async def append_to_google_doc(snapshot: str, summary: str, call_notes: str, doc_url: str, call_date: str) -> bool:
+    """Append formatted notes to Google Doc (summary at top + detailed notes under date block)."""
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not credentials_path:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS must be set")

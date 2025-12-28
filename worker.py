@@ -7,7 +7,7 @@ from temporalio.worker import Worker
 from workflow import ProcessCallNotesWorkflow
 from activities import (
     fetch_gong_transcript,
-    find_google_doc,
+    llm_find_google_doc,
     read_google_doc,
     structure_with_claude,
     append_to_google_doc,
@@ -15,7 +15,14 @@ from activities import (
 )
 
 # Configure logging to see activity logs in terminal
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s:%(name)s: %(message)s'
+)
+
+# Reduce noise from third-party libraries
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
 
 async def main():
@@ -36,7 +43,7 @@ async def main():
         workflows=[ProcessCallNotesWorkflow],
         activities=[
             fetch_gong_transcript,
-            find_google_doc,
+            llm_find_google_doc,
             read_google_doc,
             structure_with_claude,
             append_to_google_doc,

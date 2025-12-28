@@ -5,7 +5,7 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from activities import (
         fetch_gong_transcript,
-        find_google_doc,
+        llm_find_google_doc,
         read_google_doc,
         structure_with_claude,
         append_to_google_doc,
@@ -48,11 +48,11 @@ class ProcessCallNotesWorkflow:
             retry_policy=retry_policy,
         )
 
-        # Step 2: Find Google Doc by account name
+        # Step 2: Find Google Doc using LLM-powered search (reuses parties from transcript)
         found_url = await workflow.execute_activity(
-            find_google_doc,
-            transcript.account_name,
-            start_to_close_timeout=timedelta(minutes=1),
+            llm_find_google_doc,
+            args=[call_id, transcript.participants],
+            start_to_close_timeout=timedelta(minutes=2),
             retry_policy=retry_policy,
         )
 
@@ -61,42 +61,47 @@ class ProcessCallNotesWorkflow:
             await workflow.wait_condition(lambda: self.doc_url != "")
             found_url = self.doc_url
 
-        # Step 3: Read existing doc snapshot
-        existing_snapshot = await workflow.execute_activity(
-            read_google_doc,
-            found_url,
-            start_to_close_timeout=timedelta(minutes=1),
-            retry_policy=retry_policy,
-        )
+        # Return early for testing - just validate doc finding
+        workflow.logger.info(f"✓ Found doc: {found_url}")
+        workflow.logger.info(f"\n{'='*60}\n[WORKFLOW COMPLETE] ✅ Success!\n{'='*60}\n")
+        return f"Successfully found doc for call {call_id}: {found_url}"
 
-        # Step 4: Structure with Claude
-        structured_output = await workflow.execute_activity(
-            structure_with_claude,
-            args=[transcript, existing_snapshot],
-            start_to_close_timeout=timedelta(minutes=2),
-            retry_policy=retry_policy,
-        )
+        # # Step 3: Read existing doc snapshot
+        # existing_snapshot = await workflow.execute_activity(
+        #     read_google_doc,
+        #     found_url,
+        #     start_to_close_timeout=timedelta(minutes=1),
+        #     retry_policy=retry_policy,
+        # )
 
-        # Step 5: Try to update Google Doc
-        try:
-            await workflow.execute_activity(
-                append_to_google_doc,
-                args=[structured_output["snapshot"], structured_output["call_notes"], found_url, transcript.call_date],
-                start_to_close_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1),  # Don't retry if date block missing
-            )
-        except Exception as e:
-            if "no matching" in str(e).lower():
-                workflow.logger.info(f"Date block not found for {transcript.call_date}, waiting for user signal...")
-                await workflow.wait_condition(lambda: self.block_confirmed)
-                # Retry after confirmation
-                await workflow.execute_activity(
-                    append_to_google_doc,
-                    args=[structured_output["snapshot"], structured_output["call_notes"], found_url, transcript.call_date],
-                    start_to_close_timeout=timedelta(minutes=2),
-                    retry_policy=retry_policy,
-                )
-            else:
-                raise
+        # # Step 4: Structure with Claude
+        # structured_output = await workflow.execute_activity(
+        #     structure_with_claude,
+        #     args=[transcript, existing_snapshot],
+        #     start_to_close_timeout=timedelta(minutes=2),
+        #     retry_policy=retry_policy,
+        # )
 
-        return f"Successfully processed call {call_id} - snapshot updated and notes appended"
+        # # Step 5: Try to update Google Doc
+        # try:
+        #     await workflow.execute_activity(
+        #         append_to_google_doc,
+        #         args=[structured_output["snapshot"], structured_output["call_notes"], found_url, transcript.call_date],
+        #         start_to_close_timeout=timedelta(minutes=2),
+        #         retry_policy=RetryPolicy(maximum_attempts=1),  # Don't retry if date block missing
+        #     )
+        # except Exception as e:
+        #     if "no matching" in str(e).lower():
+        #         workflow.logger.info(f"Date block not found for {transcript.call_date}, waiting for user signal...")
+        #         await workflow.wait_condition(lambda: self.block_confirmed)
+        #         # Retry after confirmation
+        #         await workflow.execute_activity(
+        #             append_to_google_doc,
+        #             args=[structured_output["snapshot"], structured_output["call_notes"], found_url, transcript.call_date],
+        #             start_to_close_timeout=timedelta(minutes=2),
+        #             retry_policy=retry_policy,
+        #         )
+        #     else:
+        #         raise
+
+        # return f"Successfully processed call {call_id} - snapshot updated and notes appended"

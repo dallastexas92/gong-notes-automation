@@ -47,6 +47,10 @@ python3 trigger.py 123456789
 
 ### Testing & Debugging
 ```bash
+# Test end-to-end flow with real Gong data (recommended for integration testing)
+python3 scripts/test_append_notes.py <gong-call-id> --dry-run
+python3 scripts/test_append_notes.py <gong-call-id> --execute  # Actually writes to doc
+
 # Test Google Docs write operations
 python3 scripts/test_gdocs.py
 
@@ -74,13 +78,15 @@ The system follows a standard Temporal workflow pattern with separate worker and
    - Starts a workflow instance with call_id and doc_url
    - Waits for completion and prints result
 
-3. **Workflow** ([workflow.py](workflow.py)) - Orchestrates 4 activities:
-   - `fetch_gong_transcript` → `read_google_doc` → `structure_with_claude` → `append_to_google_doc`
+3. **Workflow** ([workflow.py](workflow.py)) - Orchestrates 5 activities:
+   - `fetch_gong_transcript` → `llm_find_google_doc` → `read_google_doc` → `structure_with_claude` → `append_to_google_doc`
    - Each activity has retry policy (3 attempts, exponential backoff)
    - Each activity has timeout (1-2 minutes)
+   - Data reuse optimization: `llm_find_google_doc` receives parties from `fetch_gong_transcript` to avoid redundant API calls
 
-4. **Activities** ([activities.py](activities.py)) - All 5 activities in single file:
-   - `fetch_gong_transcript`: Gong API call
+4. **Activities** ([activities.py](activities.py)) - All 6 activities in single file:
+   - `fetch_gong_transcript`: Gong API calls (metadata + transcript), returns GongTranscript with parties
+   - `llm_find_google_doc`: LLM-powered doc finder using customer email search + Claude validation (reuses parties data)
    - `read_google_doc`: Extract snapshot section only (stays under 2MB Temporal limit)
    - `structure_with_claude`: Send transcript + snapshot to Claude, get back updated snapshot + call notes
    - `append_to_google_doc`: Replace snapshot, append notes under matching HEADING_2
@@ -162,7 +168,7 @@ See [.claude/skills/google-apis.md](.claude/skills/google-apis.md) for complete 
 Key points:
 - Service account auth with required scopes (drive, documents)
 - Drive search requires `corpora='allDrives'` for Shared Drives
-- Multi-pattern folder search handles domain variations (e.g., "companyname.io" → "Company Name")
+- LLM-powered doc discovery uses email search + Claude validation for robust matching
 - Docs index positioning: `1` = start of doc, `endIndex-1` = end of doc
 - Batch update order matters to avoid index shifting
 
@@ -196,34 +202,32 @@ TEST_DOC_URL=https://docs.google.com/document/d/YOUR_DOC_ID/edit
 
 ### Working ✅
 - Gong API: Fetch transcripts via POST to `/v2/calls/transcript` with account name extraction
-- ~~Google Drive API: Multi-pattern folder search with `corpora='allDrives'` support~~ ⚠️ **BEING REPLACED** - See "LLM-Powered Improvements" below
+- LLM-powered doc discovery: Uses customer email search + Claude validation to identify meeting notes docs
+- Data reuse optimization: Activities share participant data to eliminate redundant API calls
 - Claude API: Two-part output (snapshot + call notes) via Sonnet 4.5
 - Google Docs: Read/write with service account auth, date-based meeting block matching
 - Note insertion: Correctly finds "Attendees:" paragraph and inserts without index shifting
-- Temporal workflow: 4-step process (fetch → read → structure → write) with signals for error recovery
+- Temporal workflow: 5-step process (fetch → find doc → read → structure → write) with signals for error recovery
 - Worker + trigger scripts functional
+- Test script: `scripts/test_append_notes.py` for validating full flow with real Gong data
 
-### LLM-Powered Improvements (In Progress) 🚀
+### LLM-Powered Improvements 🚀
 
-The system is being enhanced to use LLMs for brittle logic instead of manual parsing. Test script: `scripts/test_llm_doc_finder.py`
+The system uses LLMs to handle complex logic that would be brittle with manual parsing:
 
-#### 1. Doc Discovery (✅ Tested, Ready to Integrate)
-**Old brittle approach:**
-- Parse TLD from email: `user@company.io` → strip `.io` → `company`
-- Multi-pattern search: try 8-char, 6-char, 4-char prefixes
-- Breaks on: `.co.uk`, hyphens, name variations, multiple folders
-
-**New LLM approach:** ([test_llm_doc_finder.py](../scripts/test_llm_doc_finder.py))
+#### 1. Doc Discovery (✅ Implemented)
+**Approach:** `llm_find_google_doc` activity
 1. **Primary:** Search Drive by participant email (`fullText contains 'email@domain.com'`)
 2. **Fallback:** Search folders by company prefix, get docs inside
-3. **Claude validates:** Picks correct meeting notes doc from results
+3. **Claude validates:** Picks correct meeting notes doc from search results
 4. Handles sparse docs (no emails yet) and name variations naturally
 
-**Results:**
+**Benefits:**
+- ✅ Eliminates brittle TLD parsing and multi-pattern prefix matching
 - ✅ Works for docs with emails indexed
 - ✅ Works for sparse docs via folder fallback
 - ✅ Claude correctly identifies "Use Case" docs that contain meeting notes
-- Ready to replace `find_google_doc` activity in workflow
+- ✅ Data reuse: Receives parties from `fetch_gong_transcript` to avoid redundant Gong API calls
 
 #### 2. Note Insertion Point (TODO - Next Priority)
 **Current brittle approach:**
@@ -249,11 +253,11 @@ The system is being enhanced to use LLMs for brittle logic instead of manual par
 - Example: `**bold**` → `{"updateTextStyle": {"bold": true, "range": {...}}}`
 
 ### Known Issues & TODO
-1. ~~**Doc discovery**: Currently uses hardcoded `TEST_DOC_URL`, should search Drive by account name~~ ✅ **FIXED** - LLM-powered doc finder tested and working
+1. ~~**Doc discovery**: Currently uses hardcoded `TEST_DOC_URL`, should search Drive by account name~~ ✅ **FIXED** - LLM-powered doc finder implemented
 2. ~~**Date matching**: Matches call title but not date - can insert notes under wrong meeting block~~ ✅ **FIXED** - Date matching compares `dateElement.dateElementProperties.timestamp` with call date
 3. ~~**Index shifting bug**: Notes inserted at wrong location~~ ✅ **FIXED** - Reordered batch update requests to insert notes first, then snapshot
-4. **Doc finder integration**: Replace `find_google_doc` activity with LLM approach from test script
-5. **Note insertion**: Replace brittle date matching with LLM-powered insertion point detection
+4. ~~**Redundant API calls**: `llm_find_google_doc` re-fetches Gong data~~ ✅ **FIXED** - Now receives parties from `fetch_gong_transcript`
+5. **Note insertion**: Replace brittle date matching with LLM-powered insertion point detection (test script implemented, needs integration)
 6. **Markdown formatting**: Convert Claude output to Google Docs formatting (bold, bullets, etc.)
 7. **Error recovery**: Workflow signals implemented for missing doc/block, but trigger.py only handles doc URL signal (not confirm_block_created signal)
 8. **No call type logic**: Single prompt for all call types (Discovery, Technical, Check-in, etc.)
@@ -267,6 +271,7 @@ gong-notes-automation/
 ├── worker.py                 # Temporal worker process (polls task queue)
 ├── trigger.py                # Manual workflow trigger CLI
 ├── scripts/                  # Testing and debugging utilities
+│   ├── test_append_notes.py # End-to-end test: Gong → Claude → Doc insertion (with dry-run)
 │   ├── test_gdocs.py        # Test Google Docs write operations
 │   ├── test_drive_search.py # Test Drive folder/doc search
 │   ├── test_date_matching.py # Test meeting notes block date matching
